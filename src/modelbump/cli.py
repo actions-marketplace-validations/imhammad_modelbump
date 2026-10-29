@@ -1,7 +1,10 @@
 """Command-line interface for ModelBump."""
 
 import asyncio
+import json
 import random
+from collections import Counter
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Annotated
@@ -9,6 +12,21 @@ from typing import Annotated
 import typer
 
 from modelbump import __version__
+from modelbump.oracles import OutputKind
+from modelbump.oracles.calibrate import DEFAULT_SEED as DEFAULT_SHEET_SEED
+from modelbump.oracles.calibrate import DEFAULT_SIZE as DEFAULT_SHEET_SIZE
+from modelbump.oracles.calibrate import agreement, agreement_lines, make_sheet
+from modelbump.oracles.judge import DEFAULT_JUDGE
+from modelbump.oracles.probes import (
+    DEFAULT_BREAKER,
+    DEFAULT_PER_KIND,
+    check_probes,
+    make_probes,
+    probe_lines,
+    write_probes,
+)
+from modelbump.oracles.probes import DEFAULT_SEED as DEFAULT_PROBE_SEED
+from modelbump.oracles.report import oracles_summary, render_oracles_json, render_oracles_text
 from modelbump.registry import Status, load_registry
 from modelbump.runner import (
     Budget,
@@ -42,6 +60,21 @@ from modelbump.stats import (
     run_suite,
     simulated_suite,
 )
+from modelbump.suite import Method, Settings, build_suite, read_suite, suite_to_json
+from modelbump.suite.report import render_run_json, render_run_text, run_summary
+from modelbump.suite.run import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_REFERENCE,
+    DEFAULT_RUNS,
+    DEFAULT_TEMPERATURE,
+    run_suite_on_models,
+)
+from modelbump.synth import CallSiteResult, find_call_sites
+from modelbump.synth.cases import CaseResult, SiteCases, find_cases
+from modelbump.synth.generate import DEFAULT_GENERATOR, add_generated
+from modelbump.synth.report import CASE_RENDERERS, PromptFormat, cases_summary
+from modelbump.synth.report import RENDERERS as PROMPT_RENDERERS
+from modelbump.synth.report import summary_line as prompts_summary
 
 app = typer.Typer(
     name="modelbump",
@@ -178,6 +211,368 @@ def check(
         typer.echo(f"Rescheduled: {len(model.superseded)} earlier plan(s) were replaced.")
     if model.replacement:
         typer.echo(f"Suggested replacement: {model.replacement}")
+
+
+@app.command()
+def prompts(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Folder or Python file to read.", exists=True, resolve_path=True),
+    ] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option(help="Only list the calls to this model ID, e.g. gpt-4o-mini."),
+    ] = None,
+    output_format: Annotated[
+        PromptFormat,
+        typer.Option("--format", help="Report format: text or json."),
+    ] = PromptFormat.TEXT,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option(help="Skip paths matching this pattern, e.g. 'scripts'. Repeat for more."),
+    ] = None,
+    skip_tests: Annotated[
+        bool,
+        typer.Option(help="Leave out test files and test folders."),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Write the report to this file instead of the screen.", dir_okay=False),
+    ] = None,
+) -> None:
+    """List the LLM calls in Python code, with each call's model and prompt template."""
+    result = find_call_sites(path, exclude or (), skip_tests)
+    if model is not None:
+        kept = tuple(call for call in result.calls if call.model == model)
+        result = CallSiteResult(kept, result.files_read, result.unparsed)
+    rendered = PROMPT_RENDERERS[output_format](result)
+    if output is None:
+        typer.echo(rendered, nl=False)
+    else:
+        output.write_text(rendered, encoding="utf-8")
+        typer.echo(f"Wrote {output_format.value} report to {output}.")
+        typer.echo(prompts_summary(result))
+
+
+@app.command()
+def cases(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Folder or Python file to read.", exists=True, resolve_path=True),
+    ] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option(help="Only list the calls to this model ID, e.g. gpt-4o-mini."),
+    ] = None,
+    output_format: Annotated[
+        PromptFormat,
+        typer.Option("--format", help="Report format: text or json."),
+    ] = PromptFormat.TEXT,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option(help="Do not list calls in paths matching this pattern. Repeat for more."),
+    ] = None,
+    skip_tests: Annotated[
+        bool,
+        typer.Option(help="Do not list calls made in test files (their inputs are still read)."),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Write the report to this file instead of the screen.", dir_okay=False),
+    ] = None,
+    generate: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Have a model write inputs until each call with slots has this many cases.",
+        ),
+    ] = 0,
+    generator: Annotated[
+        str,
+        typer.Option(help="The model that writes inputs, as endpoint/model."),
+    ] = DEFAULT_GENERATOR,
+    budget_requests: Annotated[
+        int | None,
+        typer.Option(min=1, help="Stop after this many requests to the writer model."),
+    ] = None,
+) -> None:
+    """Find test inputs for each LLM call: from the app's own tests and code, then generated.
+
+    With --generate N, a model (local Qwen 2.5 by default) writes inputs for the
+    calls that have fewer than N cases. Generated cases say which model wrote them.
+    """
+    result = find_cases(path, exclude or (), skip_tests)
+    if model is not None:
+        kept: tuple[SiteCases, ...] = tuple(s for s in result.sites if s.site.model == model)
+        result = CaseResult(kept, result.files_read, result.unparsed)
+    if generate > 0:
+        result = _generate_cases(result, generate, generator, budget_requests)
+    rendered = CASE_RENDERERS[output_format](result)
+    if output is None:
+        typer.echo(rendered, nl=False)
+    else:
+        output.write_text(rendered, encoding="utf-8")
+        typer.echo(f"Wrote {output_format.value} report to {output}.")
+        typer.echo(cases_summary(result))
+
+
+def _generate_cases(
+    result: CaseResult, count: int, generator: str, budget_requests: int | None
+) -> CaseResult:
+    """Run the writer model for `cases --generate`, with the cache and a budget."""
+    try:
+        endpoint, _ = resolve_model(generator)
+        probe = pin_versions([ChatRequest.ask(generator, "version")])[0]
+    except ValueError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    except RunnerError as error:
+        _print_error(error, generator)
+        raise typer.Exit(code=1) from error
+    if not endpoint.local:
+        typer.echo(
+            f"Note: {endpoint.name} is a free cloud tier. The app's prompts leave this machine "
+            "and may be kept or read by the provider. Never send private code.",
+            err=True,
+        )
+    cache = ResponseCache()
+    budget = Budget(max_requests=budget_requests)
+    runner = Runner(cache=cache, budget=budget)
+    try:
+        done = asyncio.run(add_generated(result, runner, count, generator, probe.model_version))
+    finally:
+        cache.close()
+    typer.echo(
+        f"Asked {generator} for inputs for {done.asked} {'call' if done.asked == 1 else 'calls'}: "
+        f"{done.added} generated {'case' if done.added == 1 else 'cases'}. {budget.summary()}",
+        err=True,
+    )
+    for site, reason in done.skipped:
+        typer.echo(f"  {site.path}:{site.line}: {reason}", err=True)
+    return done.result
+
+
+@app.command()
+def suite(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Folder or Python file to read.", exists=True, resolve_path=True),
+    ] = Path("."),
+    output: Annotated[
+        Path,
+        typer.Option(help="Where to write the suite file.", dir_okay=False),
+    ] = Path("modelbump-suite.json"),
+    model: Annotated[
+        str | None,
+        typer.Option(help="Only the calls to this model ID, e.g. gpt-4o-mini."),
+    ] = None,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option(help="Leave out calls in paths matching this pattern. Repeat for more."),
+    ] = None,
+    skip_tests: Annotated[
+        bool,
+        typer.Option(help="Leave out calls made in test files (their inputs are still read)."),
+    ] = False,
+    generate: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Have a model write inputs until each call with slots has this many cases.",
+        ),
+    ] = 0,
+    generator: Annotated[
+        str,
+        typer.Option(help="The model that writes inputs, as endpoint/model."),
+    ] = DEFAULT_GENERATOR,
+    budget_requests: Annotated[
+        int | None,
+        typer.Option(min=1, help="Stop after this many requests to the writer model."),
+    ] = None,
+) -> None:
+    """Write a suite file: every complete test case, with its messages and its oracle."""
+    result = find_cases(path, exclude or (), skip_tests)
+    if model is not None:
+        kept: tuple[SiteCases, ...] = tuple(s for s in result.sites if s.site.model == model)
+        result = CaseResult(kept, result.files_read, result.unparsed)
+    if generate > 0:
+        result = _generate_cases(result, generate, generator, budget_requests)
+    built = build_suite(result)
+    output.write_text(suite_to_json(built), encoding="utf-8")
+    calls = len({(c.path, c.line) for c in built.cases})
+    typer.echo(
+        f"Wrote {len(built.cases)} test {'case' if len(built.cases) == 1 else 'cases'} "
+        f"for {calls} LLM {'call' if calls == 1 else 'calls'} to {output}."
+    )
+    for where, reason in built.left_out:
+        typer.echo(f"  left out {where}: {reason}")
+
+
+@app.command("test")
+def test_models(
+    suite_file: Annotated[
+        Path,
+        typer.Argument(help="The suite file from `modelbump suite`.", exists=True, dir_okay=False),
+    ],
+    old: Annotated[
+        str, typer.Option("--from", help="The model the app uses now, as endpoint/model.")
+    ],
+    new: Annotated[str, typer.Option("--to", help="The model to move to, as endpoint/model.")],
+    runs: Annotated[
+        int, typer.Option(min=1, help="Answers per model per case (the most, for sequential).")
+    ] = DEFAULT_RUNS,
+    reference: Annotated[
+        int,
+        typer.Option(min=1, help="Old-model answers per case that set the reference (not scored)."),
+    ] = DEFAULT_REFERENCE,
+    method: Annotated[
+        Method,
+        typer.Option(help="fixed (k + BH), sequential (+ e-BH), or auto (by --runs, ADR 0047)."),
+    ] = Method.AUTO,
+    from_think: Annotated[
+        str | None,
+        typer.Option(help="Reasoning effort for the --from model: none, low, medium or high."),
+    ] = None,
+    to_think: Annotated[
+        str | None,
+        typer.Option(help="Reasoning effort for the --to model, e.g. none for Qwen 3."),
+    ] = None,
+    temperature: Annotated[
+        float, typer.Option(min=0.0, help="Sampling temperature for both models.")
+    ] = DEFAULT_TEMPERATURE,
+    max_tokens: Annotated[
+        int, typer.Option(min=1, help="Longest answer, in tokens.")
+    ] = DEFAULT_MAX_TOKENS,
+    judge: Annotated[
+        str,
+        typer.Option(help="The model that judges free-text answers, as endpoint/model."),
+    ] = DEFAULT_JUDGE,
+    no_judge: Annotated[
+        bool,
+        typer.Option("--no-judge", help="Check free text with property checks only."),
+    ] = False,
+    budget_requests: Annotated[
+        int | None,
+        typer.Option(min=1, help="Stop after this many requests (cached answers are free)."),
+    ] = None,
+    output_format: Annotated[
+        PromptFormat,
+        typer.Option("--format", help="Report format: text or json (every answer and score)."),
+    ] = PromptFormat.TEXT,
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Write the report to this file instead of the screen.", dir_okay=False),
+    ] = None,
+) -> None:
+    """Run a suite on the old and the new model and decide each test case.
+
+    Exits with 1 when a case REGRESSED or could not be run, so CI can fail on it.
+    """
+    try:
+        cases_to_run = read_suite(suite_file)
+        settings = Settings(
+            old=old,
+            new=new,
+            runs=runs,
+            reference=reference,
+            method=method,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            old_think=from_think,
+            new_think=to_think,
+        )
+        has_text = any(c.oracle.kind is OutputKind.TEXT for c in cases_to_run.cases)
+        judge_model = None if no_judge or not has_text else judge
+        names = [old, new] + ([judge_model] if judge_model is not None else [])
+        endpoints = [resolve_model(model_name)[0] for model_name in names]
+        probes = pin_versions([ChatRequest.ask(name, "version") for name in names])
+    except ValueError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    except RunnerError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    if not cases_to_run.cases:
+        typer.echo("Error: the suite has no test cases.", err=True)
+        raise typer.Exit(code=2)
+    if not all(endpoint.local for endpoint in endpoints):
+        typer.echo(
+            "Note: a free cloud tier is in use. The app's prompts leave this machine "
+            "and may be kept or read by the provider. Never send private code.",
+            err=True,
+        )
+    settings = replace(
+        settings,
+        old_version=probes[0].model_version,
+        new_version=probes[1].model_version,
+        judge=judge_model,
+        judge_version=probes[2].model_version if judge_model is not None else "",
+    )
+    cache = ResponseCache()
+    budget = Budget(max_requests=budget_requests)
+    runner = Runner(cache=cache, budget=budget)
+    try:
+        result = asyncio.run(run_suite_on_models(cases_to_run, runner, settings))
+    finally:
+        cache.close()
+    render = render_run_json if output_format is PromptFormat.JSON else render_run_text
+    rendered = render(result)
+    if output is None:
+        typer.echo(rendered, nl=False)
+    else:
+        output.write_text(rendered, encoding="utf-8")
+        typer.echo(f"Wrote {output_format.value} report to {output}.")
+        typer.echo(run_summary(result))
+    typer.echo(budget.summary(), err=True)
+    if result.errors and budget_requests is not None:
+        typer.echo(
+            "Answers so far are cached: run the same command with a higher limit to continue.",
+            err=True,
+        )
+    if result.regressed or result.errors:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def oracles(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Folder or Python file to read.", exists=True, resolve_path=True),
+    ] = Path("."),
+    model: Annotated[
+        str | None,
+        typer.Option(help="Only list the calls to this model ID, e.g. gpt-4o-mini."),
+    ] = None,
+    output_format: Annotated[
+        PromptFormat,
+        typer.Option("--format", help="Report format: text or json."),
+    ] = PromptFormat.TEXT,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option(help="Skip paths matching this pattern, e.g. 'scripts'. Repeat for more."),
+    ] = None,
+    skip_tests: Annotated[
+        bool,
+        typer.Option(help="Leave out test files and test folders."),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Write the report to this file instead of the screen.", dir_okay=False),
+    ] = None,
+) -> None:
+    """Show how each LLM call's answers will be checked: JSON, label or free text."""
+    result = find_call_sites(path, exclude or (), skip_tests)
+    if model is not None:
+        kept = tuple(call for call in result.calls if call.model == model)
+        result = CallSiteResult(kept, result.files_read, result.unparsed)
+    render = render_oracles_json if output_format is PromptFormat.JSON else render_oracles_text
+    rendered = render(result)
+    if output is None:
+        typer.echo(rendered, nl=False)
+    else:
+        output.write_text(rendered, encoding="utf-8")
+        typer.echo(f"Wrote {output_format.value} report to {output}.")
+        typer.echo(oracles_summary(result))
 
 
 @app.command()
@@ -349,6 +744,204 @@ def cache_clear(
     finally:
         cache.close()
     typer.echo(f"Deleted {deleted} stored answers.")
+
+
+judge_app = typer.Typer(
+    help="Check the free-text judge against your own labels.", no_args_is_help=True
+)
+app.add_typer(judge_app, name="judge")
+
+
+@judge_app.command("sheet")
+def judge_sheet(
+    report: Annotated[
+        Path,
+        typer.Argument(
+            help="A `modelbump test --format json` report.", exists=True, dir_okay=False
+        ),
+    ],
+    output: Annotated[
+        Path, typer.Option(help="The blind sheet to label (CSV).", dir_okay=False)
+    ] = Path("judge-sheet.csv"),
+    key: Annotated[
+        Path,
+        typer.Option(help="What the sheet hides: models and judge verdicts.", dir_okay=False),
+    ] = Path("judge-key.json"),
+    size: Annotated[
+        int, typer.Option(min=2, help="Answers to draw, half judged PASS, half FAIL.")
+    ] = DEFAULT_SHEET_SIZE,
+    seed: Annotated[int, typer.Option(help="Seed for drawing and shuffling.")] = DEFAULT_SHEET_SEED,
+    exclude_key: Annotated[
+        list[Path] | None,
+        typer.Option(
+            help="Leave out the answers of an earlier sheet's key. Repeat for more.",
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
+) -> None:
+    """Write a blind sheet of judged answers for you to label PASS or FAIL."""
+    try:
+        made = make_sheet(report, output, key, size, seed, exclude_key or ())
+    except (ValueError, KeyError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    typer.echo(
+        f"Wrote {made.rows} rows ({made.answers} answers: {made.drawn['PASS']} judged PASS, "
+        f"{made.drawn['FAIL']} FAIL) to {output}, and the key to {key}."
+    )
+    if made.excluded:
+        typer.echo(f"Left out {made.excluded} answers that earlier sheets hold.")
+    typer.echo(
+        f"The report had {made.available['PASS']} PASS and {made.available['FAIL']} FAIL. "
+        "Fill in your_label with PASS or FAIL, without looking at the key."
+    )
+
+
+@judge_app.command("agreement")
+def judge_agreement(
+    sheet: Annotated[
+        Path, typer.Argument(help="The labelled sheet (CSV).", exists=True, dir_okay=False)
+    ],
+    key: Annotated[
+        Path,
+        typer.Argument(help="The key from `modelbump judge sheet`.", exists=True, dir_okay=False),
+    ],
+    report: Annotated[
+        Path | None,
+        typer.Option(
+            help="Compare with this report's verdicts instead (the same run, judged again).",
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
+) -> None:
+    """How often the judge agrees with your labels, and pass rates corrected for it."""
+    try:
+        result = agreement(sheet, key, report)
+    except (ValueError, KeyError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    for line in agreement_lines(result):
+        typer.echo(line)
+
+
+@judge_app.command("probes")
+def judge_probes(
+    report: Annotated[
+        Path,
+        typer.Argument(
+            help="A `modelbump test --format json` report.", exists=True, dir_okay=False
+        ),
+    ],
+    output: Annotated[
+        Path, typer.Option(help="The blind probe sheet to label (CSV).", dir_okay=False)
+    ] = Path("probe-sheet.csv"),
+    key: Annotated[
+        Path,
+        typer.Option(help="What the sheet hides: each probe's kind and verdict.", dir_okay=False),
+    ] = Path("probe-key.json"),
+    breaker: Annotated[
+        str, typer.Option(help="The model that writes the probes, as endpoint/model.")
+    ] = DEFAULT_BREAKER,
+    judge: Annotated[
+        str, typer.Option(help="The judge to test, as endpoint/model.")
+    ] = DEFAULT_JUDGE,
+    per_kind: Annotated[
+        int, typer.Option(min=1, help="Probes of each kind per free-text case.")
+    ] = DEFAULT_PER_KIND,
+    seed: Annotated[int, typer.Option(help="Seed for shuffling the sheet.")] = DEFAULT_PROBE_SEED,
+    budget_requests: Annotated[
+        int | None,
+        typer.Option(min=1, help="Stop after this many requests (cached answers are free)."),
+    ] = None,
+) -> None:
+    """Break reference answers on purpose, judge them, and write a blind sheet to check."""
+    try:
+        data = json.loads(report.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != 1 or "cases" not in data:
+            raise ValueError(f"{report} is not a `modelbump test --format json` report")
+        if any("reference_answer" not in case for case in data["cases"]):
+            raise ValueError(f"{report} is from an older ModelBump; run `modelbump test` again")
+        endpoints = [resolve_model(name)[0] for name in (breaker, judge)]
+        pinned = pin_versions([ChatRequest.ask(name, "version") for name in (breaker, judge)])
+    except (ValueError, RunnerError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    if not all(endpoint.local for endpoint in endpoints):
+        typer.echo(
+            "Note: a free cloud tier is in use. The app's prompts leave this machine "
+            "and may be kept or read by the provider. Never send private code.",
+            err=True,
+        )
+    cache = ResponseCache()
+    budget = Budget(max_requests=budget_requests)
+    runner = Runner(cache=cache, budget=budget)
+    try:
+        run = asyncio.run(
+            make_probes(
+                data,
+                runner,
+                breaker=breaker,
+                judge=judge,
+                judge_version=pinned[1].model_version,
+                per_kind=per_kind,
+            )
+        )
+    except RunnerError as error:
+        typer.echo(f"Error: {error}", err=True)
+        typer.echo("Answers so far are cached: run the same command again to continue.", err=True)
+        raise typer.Exit(code=1) from error
+    finally:
+        cache.close()
+    if not run.probes:
+        typer.echo("Error: the report has no free-text cases with a reference answer.", err=True)
+        raise typer.Exit(code=2)
+    write_probes(
+        run,
+        data,
+        report,
+        output,
+        key,
+        breaker=breaker,
+        judge=judge,
+        judge_version=pinned[1].model_version,
+        per_kind=per_kind,
+        seed=seed,
+    )
+    verdicts = Counter(probe.judge for probe in run.probes)
+    typer.echo(
+        f"Wrote {len(run.probes)} probes for {run.cases} free-text cases to {output}, "
+        f"and the key to {key}."
+    )
+    if run.missing:
+        typer.echo(f"The breaker could not write: {dict(run.missing)}.")
+    typer.echo(
+        f"The judge said PASS {verdicts['PASS']}, FAIL {verdicts['FAIL']}"
+        + (f", unclear {verdicts['unclear']}." if verdicts["unclear"] else ".")
+    )
+    typer.echo("Fill in your_label with PASS or FAIL, without looking at the key.")
+    typer.echo(budget.summary(), err=True)
+
+
+@judge_app.command("probe-check")
+def judge_probe_check(
+    sheet: Annotated[
+        Path, typer.Argument(help="The labelled probe sheet (CSV).", exists=True, dir_okay=False)
+    ],
+    key: Annotated[
+        Path,
+        typer.Argument(help="The key from `modelbump judge probes`.", exists=True, dir_okay=False),
+    ],
+) -> None:
+    """Which kinds of broken answer the judge catches, checked against your labels."""
+    try:
+        result = check_probes(sheet, key)
+    except (ValueError, KeyError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    for line in probe_lines(result):
+        typer.echo(line)
 
 
 stats_app = typer.Typer(

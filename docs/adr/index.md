@@ -53,3 +53,17 @@ Format: [Michael Nygard's ADR template](https://cognitect.com/blog/2011/11/15/do
 | [0045](0045-scores-and-stopping-cases-that-look-fine.md) | Accept scores between 0 and 1, and optionally stop test cases that look fine | Accepted |
 | [0046](0046-real-model-experiment.md) | Test the stats engine on real local models with computed answers, a null pair and injected regressions | Accepted |
 | [0047](0047-real-model-results.md) | Pick fixed k + BH or sequential + e-BH by budget, and report regressions per test case | Accepted |
+| [0048](0048-find-llm-calls-and-prompt-templates.md) | Find each LLM call and its prompt template with Python's own parser, inside one file | Accepted |
+| [0049](0049-follow-prompts-across-files-classes-and-functions.md) | Follow prompts into other files, class attributes and the app's own prompt functions | Accepted |
+| [0050](0050-test-inputs-from-the-apps-own-callers.md) | Take the first test inputs from the values the app's own tests and code pass in | Accepted |
+| [0051](0051-generated-test-inputs-from-a-local-model.md) | Have a local model write the missing test inputs, and mark every one as generated | Accepted |
+| [0052](0052-oracles-by-output-type.md) | Check answers against the old model's answers, with an oracle picked by output type | Accepted |
+| [0053](0053-suite-file-and-modelbump-test.md) | Write the suite to a file, then run it on both models with `modelbump test` | Accepted |
+| [0054](0054-llm-judge-for-free-text.md) | Judge free-text answers with a third local model, against an old reference answer | Accepted |
+| [0055](0055-check-the-judge-against-hand-labels.md) | Check the judge against blind hand labels drawn by verdict, and correct pass rates for it | Accepted |
+| [0056](0056-bigger-judge-and-no-invented-facts.md) | Use Gemma 3 12B as the judge, fail invented facts, and test the change on fresh labels | Accepted |
+| [0057](0057-benchmark-corpus-from-migration-snapshots.md) | Build the benchmark corpus from apps that really migrated, as they were before the migration | Accepted |
+| [0058](0058-judge-probes.md) | Test the judge with answers broken on purpose | Accepted |
+| [0059](0059-run-the-corpus-end-to-end.md) | Run the corpus end to end, a few calls per app, and label across apps | Accepted |
+| [0060](0060-judge-instructions-from-corpus-labels.md) | Rewrite the judge's instructions from the corpus labels, drop cases with a wrong reference, and test on fresh labels | Accepted |
+| [0061](0061-no-made-up-specifics.md) | Fail made-up specifics about the app, and stop tuning the judge | Accepted |
