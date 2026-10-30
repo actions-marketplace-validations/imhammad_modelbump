@@ -10,6 +10,9 @@ answer is scored in [0, 1], and the stats engine decides the case:
 - **sequential:** answers come one round at a time and a case stops as soon
   as its verdict is clear, with e-BH across the suite (ADRs 0042, 0043).
 - **auto** (default) follows ADR 0047: fixed for up to 100 runs, else sequential.
+
+With a patched suite (ADR 0062) the new model is sent the patched messages,
+while the reference, the oracle and the judge keep the app's own prompt.
 """
 
 from collections import Counter
@@ -69,10 +72,15 @@ class Settings:
     judge: str | None = None
     """The model that judges free-text answers (ADR 0054), or None for property checks only."""
     judge_version: str = ""
+    offset: int = 0
+    """Scored answers use samples ``reference + offset`` onwards. The repair loop
+    confirms a patch on samples no earlier run used (ADR 0064)."""
 
     def __post_init__(self) -> None:
         if self.runs < 1:
             raise ValueError(f"runs must be at least 1, got {self.runs}")
+        if self.offset < 0:
+            raise ValueError(f"offset must be at least 0, got {self.offset}")
         if self.reference < 1:
             raise ValueError(f"reference must be at least 1, got {self.reference}")
 
@@ -100,6 +108,8 @@ class CaseRun:
     """Everything one case got: the reference, the scored answers and the verdict."""
 
     case: SuiteCase
+    patched: SuiteCase | None = None
+    """What the new model is sent when a patch changed this case (ADR 0062)."""
     reference: Reference | None = None
     reference_answers: list[str] = field(default_factory=list)
     old: list[Answer] = field(default_factory=list)
@@ -107,6 +117,11 @@ class CaseRun:
     verdict: Verdict = Verdict.INCONCLUSIVE
     error: str | None = None
     """Why the case could not be run (a request failed or the budget ran out)."""
+
+    @property
+    def sent_to_new(self) -> SuiteCase:
+        """The case as the new model gets it: patched, or the app's own."""
+        return self.patched if self.patched is not None else self.case
 
     @property
     def old_mean(self) -> float:
@@ -138,6 +153,11 @@ class SuiteRun:
     @property
     def regressed(self) -> bool:
         return self.counts[Verdict.REGRESSED] > 0
+
+    @property
+    def patched(self) -> int:
+        """How many cases the new model got with a patch."""
+        return sum(run.patched is not None for run in self.cases)
 
 
 def request(case: SuiteCase, settings: Settings, which: str, sample: int) -> ChatRequest:
@@ -186,6 +206,8 @@ async def _judge(
         return answers
     assert settings.judge is not None
     reference = run.reference_answers[0]
+    # The judge reads the app's own prompt, even for a patched case: a patch must
+    # not be able to pass by changing the task.
     requests = [
         judge_request(run.case.messages, reference, a.text, settings.judge, settings.judge_version)
         for a in answers
@@ -208,12 +230,13 @@ def _scored(run: CaseRun, samples: Sequence[int], texts: Sequence[str]) -> list[
 
 
 async def _fixed(runs: Sequence[CaseRun], runner: Runner, settings: Settings) -> None:
-    samples = list(range(settings.reference, settings.reference + settings.runs))
+    first = settings.reference + settings.offset
+    samples = list(range(first, first + settings.runs))
     for run in runs:
         try:
             await _set_reference(run, runner, settings)
             requests = [request(run.case, settings, "old", s) for s in samples]
-            requests += [request(run.case, settings, "new", s) for s in samples]
+            requests += [request(run.sent_to_new, settings, "new", s) for s in samples]
             texts = _texts(await runner.run_each(requests))
             answers = await _judge(run, runner, settings, _scored(run, samples * 2, texts))
         except RunnerError as error:
@@ -247,11 +270,11 @@ async def _sequential(runs: Sequence[CaseRun], runner: Runner, settings: Setting
         test = SequentialTest(alpha=settings.q / m, margin=settings.margin, max_runs=settings.runs)
         try:
             await _set_reference(run, runner, settings)
-            sample = settings.reference
+            sample = settings.reference + settings.offset
             while not test.done:
                 pair = [
                     request(run.case, settings, "old", sample),
-                    request(run.case, settings, "new", sample),
+                    request(run.sent_to_new, settings, "new", sample),
                 ]
                 old_text, new_text = _texts(await runner.run_each(pair))
                 old, new = await _judge(
@@ -271,11 +294,23 @@ async def _sequential(runs: Sequence[CaseRun], runner: Runner, settings: Setting
             run.verdict = verdict
 
 
-async def run_suite_on_models(suite: Suite, runner: Runner, settings: Settings) -> SuiteRun:
-    """Answer, score and decide every case of the suite."""
+async def run_suite_on_models(
+    suite: Suite, runner: Runner, settings: Settings, patched: Suite | None = None
+) -> SuiteRun:
+    """Answer, score and decide every case of the suite.
+
+    ``patched`` is the same suite with patches applied (ADR 0062): the new model
+    gets its messages, everything else uses ``suite``.
+    """
     if not suite.cases:
         raise ValueError("the suite has no test cases")
     runs = [CaseRun(case) for case in suite.cases]
+    if patched is not None:
+        if [c.id for c in patched.cases] != [c.id for c in suite.cases]:
+            raise ValueError("the patched suite must have the same cases in the same order")
+        for run, case in zip(runs, patched.cases, strict=True):
+            if case.messages != run.case.messages:
+                run.patched = case
     if settings.chosen is Method.FIXED:
         await _fixed(runs, runner, settings)
     else:

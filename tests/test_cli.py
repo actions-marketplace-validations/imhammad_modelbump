@@ -736,7 +736,10 @@ def _fake_models(monkeypatch: pytest.MonkeyPatch, broken: str = "") -> list[dict
         if body["messages"][0]["content"].startswith("You grade"):
             text = "FAIL" if "WRONG" in prompt else "PASS"  # the judge
         elif prompt.startswith("Ticket"):
-            text = "feature" if broken and broken in prompt and "new" in body["model"] else "bug"
+            # A patch that asks for the label only fixes the new model (ADR 0062).
+            fixed = "label only" in body["messages"][0]["content"]
+            wrong = broken and broken in prompt and "new" in body["model"] and not fixed
+            text = "feature" if wrong else "bug"
         else:
             # Every answer differs, so each one is a new question for the judge.
             text = f"A short answer from {body['model']}, number {body['seed']}. Done."
@@ -883,6 +886,346 @@ def test_test_fails_on_a_regression_and_writes_json(
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["cases"][0]["id"] == "support.py:24#1"
     assert data["cases"][0]["verdict"] == "REGRESSED"
+
+
+def _patch_file(tmp_path: Path, patch: dict[str, object]) -> Path:
+    path = tmp_path / "patch.json"
+    path.write_text(json.dumps({"version": 1, "patches": [patch]}), encoding="utf-8")
+    return path
+
+
+LABEL_ONLY: dict[str, object] = {
+    "call": "support.py:24",
+    "add_system": "Reply with the label only.",
+}
+
+
+def test_test_with_a_patch_sends_it_to_the_new_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    suite_file = _demo_suite(tmp_path)
+    _fake_models(monkeypatch, broken="crashes")
+    patch = _patch_file(tmp_path, LABEL_ONLY)
+    args = ["test", str(suite_file), "--from", "ollama/old", "--to", "ollama/new", "--no-judge"]
+    result = runner.invoke(app, [*args, "--patch", str(patch)])
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith(
+        "Compared ollama/old -> ollama/new on 5 test cases, 3 patched for the new model:"
+    )
+    assert any("support.py:24#1" in line and "[patched]" in line for line in lines)
+    assert lines[-1] == "Result: 0 regressed, 0 inconclusive, 5 equivalent, 0 improved."
+
+
+def test_test_refuses_a_patch_that_does_not_fit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    suite_file = _demo_suite(tmp_path)
+    seen = _fake_models(monkeypatch)
+    patch = _patch_file(tmp_path, {"call": "nowhere.py:1", "add_system": "x"})
+    args = ["test", str(suite_file), "--from", "ollama/old", "--to", "ollama/new"]
+    result = runner.invoke(app, [*args, "--patch", str(patch)])
+    assert result.exit_code == 2
+    assert "Error: no case in the suite for call nowhere.py:1" in result.stderr
+    assert seen == []
+
+
+def test_repair_show_prints_a_diff_per_case(tmp_path: Path) -> None:
+    suite_file = _demo_suite(tmp_path)
+    patch = _patch_file(
+        tmp_path,
+        {
+            "call": "support.py:24",
+            "edits": [{"find": "one label", "replace": "exactly one label"}],
+        },
+    )
+    result = runner.invoke(app, ["repair", "show", str(suite_file), str(patch)])
+    assert result.exit_code == 0, result.output
+    out = result.stdout
+    assert out.count("--- support.py:24#") == 3
+    assert "-Answer with one label: bug, feature, question." in out
+    assert "+Answer with exactly one label: bug, feature, question." in out
+    assert out.splitlines()[-1] == "The patch changes 3 test cases in 1 LLM call."
+
+
+def test_repair_show_warns_when_a_call_has_one_case(tmp_path: Path) -> None:
+    suite_file = _demo_suite(tmp_path)
+    patch = _patch_file(tmp_path, {"call": "bot.py:14", "add_system": "Be brief."})
+    result = runner.invoke(app, ["repair", "show", str(suite_file), str(patch)])
+    assert result.exit_code == 0
+    assert result.stdout.splitlines()[-2:] == [
+        "The patch changes 1 test case in 1 LLM call.",
+        "  bot.py:14 has one test case, so an edit there could touch its inputs: check the diff.",
+    ]
+
+
+def test_repair_show_errors(tmp_path: Path) -> None:
+    suite_file = _demo_suite(tmp_path)
+    patch = _patch_file(
+        tmp_path, {"call": "support.py:24", "edits": [{"find": "crashes", "replace": "works"}]}
+    )
+    result = runner.invoke(app, ["repair", "show", str(suite_file), str(patch)])
+    assert result.exit_code == 2
+    assert "Error: case support.py:24#2: 'crashes' is found 0 times" in result.stderr
+
+
+def _demo_report(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    """The demo suite and a JSON report where support.py:24#1 REGRESSED."""
+    suite_file = _demo_suite(tmp_path)
+    report = tmp_path / "report.json"
+    real_init = Runner.__init__
+    _fake_models(monkeypatch, broken="crashes")
+    args = ["test", str(suite_file), "--from", "ollama/old", "--to", "ollama/new", "--no-judge"]
+    assert runner.invoke(app, [*args, "--format", "json", "--output", str(report)]).exit_code == 1
+    monkeypatch.setattr(Runner, "__init__", real_init)
+    return suite_file, report
+
+
+def _fake_proposer(monkeypatch: pytest.MonkeyPatch, answers: list[str]) -> list[dict[str, object]]:
+    seen: list[dict[str, object]] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": answers[body["seed"]]}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+            },
+        )
+
+    real_init = Runner.__init__
+
+    def init_with_fake_server(self: Runner, **options: object) -> None:
+        real_init(self, transport=httpx.MockTransport(server), **options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Runner, "__init__", init_with_fake_server)
+    return seen
+
+
+def test_repair_propose_writes_candidates_to_test(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    suite_file, report = _demo_report(monkeypatch, tmp_path)
+    good = json.dumps({"add_system": "Reply with the label only.", "edits": [], "why": "Short."})
+    seen = _fake_proposer(monkeypatch, [good, good, "no idea"])
+    out = tmp_path / "proposals"
+    args = ["repair", "propose", str(suite_file), str(report), "--candidates", "3"]
+    result = runner.invoke(app, [*args, "--output-dir", str(out)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines() == [
+        "support.py:24: 1 candidate, 2 refused",
+        "  sample 1 refused: the same as sample 0",
+        "  sample 2 refused: no JSON object in the answer",
+        f"Wrote 1 candidate patch for 1 call to {out}.",
+    ]
+    assert {body["model"] for body in seen} == {"gemma3:12b"}
+    assert "Spent: 3 requests" in result.stderr
+    # The candidate is a normal patch file: it can be shown and tested.
+    candidate = out / "support.py-24.00.json"
+    shown = runner.invoke(app, ["repair", "show", str(suite_file), str(candidate)])
+    assert shown.stdout.splitlines()[-1] == "The patch changes 3 test cases in 1 LLM call."
+
+
+def test_repair_propose_with_nothing_regressed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    suite_file = _demo_suite(tmp_path)
+    report = tmp_path / "report.json"
+    real_init = Runner.__init__
+    _fake_models(monkeypatch)
+    args = ["test", str(suite_file), "--from", "ollama/old", "--to", "ollama/new", "--no-judge"]
+    assert runner.invoke(app, [*args, "--format", "json", "--output", str(report)]).exit_code == 0
+    monkeypatch.setattr(Runner, "__init__", real_init)
+    seen = _fake_proposer(monkeypatch, [])
+    result = runner.invoke(app, ["repair", "propose", str(suite_file), str(report)])
+    assert result.exit_code == 0
+    assert result.stdout == "No case REGRESSED in the report: nothing to repair.\n"
+    assert seen == []
+
+
+def test_repair_propose_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    suite_file = _demo_suite(tmp_path)
+    bad = tmp_path / "bad.json"
+    bad.write_text("{}", encoding="utf-8")
+    result = runner.invoke(app, ["repair", "propose", str(suite_file), str(bad)])
+    assert result.exit_code == 2
+    assert "Error: the report has no cases" in result.stderr
+    result = runner.invoke(
+        app, ["repair", "propose", str(suite_file), str(bad), "--model", "nowhere/x"]
+    )
+    assert result.exit_code == 2
+    assert "Unknown endpoint" in result.stderr
+
+
+def test_repair_propose_warns_before_a_cloud_tier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    suite_file, report = _demo_report(monkeypatch, tmp_path)
+    _fake_proposer(monkeypatch, ["{}"])
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    args = ["repair", "propose", str(suite_file), str(report), "--candidates", "1"]
+    result = runner.invoke(app, [*args, "--model", "groq/p", "--output-dir", str(tmp_path / "out")])
+    assert "The app's prompts leave this machine" in result.stderr
+
+
+def _demo_proposals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, add_system: list[str]
+) -> tuple[Path, Path]:
+    """The demo suite and a `repair propose` folder with one candidate per instruction."""
+    original = Runner.__init__
+    suite_file, report = _demo_report(monkeypatch, tmp_path)
+    answers = [json.dumps({"add_system": text, "edits": [], "why": "w"}) for text in add_system]
+    _fake_proposer(monkeypatch, answers)
+    out = tmp_path / "proposals"
+    args = ["repair", "propose", str(suite_file), str(report), "--output-dir", str(out)]
+    assert runner.invoke(app, [*args, "--candidates", str(len(answers))]).exit_code == 0
+    monkeypatch.setattr(Runner, "__init__", original)
+    return suite_file, out
+
+
+def test_repair_run_accepts_the_fix_and_writes_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    suite_file, proposals = _demo_proposals(
+        monkeypatch, tmp_path, ["Be nice.", "Reply with the label only."]
+    )
+    _fake_models(monkeypatch, broken="crashes")
+    out, report = tmp_path / "repair.json", tmp_path / "repair-report.json"
+    args = ["repair", "run", str(suite_file), str(proposals), "--from", "ollama/old"]
+    result = runner.invoke(
+        app,
+        [
+            *args,
+            "--to",
+            "ollama/new",
+            "--confirm-runs",
+            "50",
+            "--output",
+            str(out),
+            "--report",
+            str(report),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("Repair ollama/old -> ollama/new: screen each candidate on 10 runs")
+    assert lines[1] == "REPAIRED      support.py:24  (3 test cases)"
+    assert "              confirm support.py-24.01.json: accepted" in lines
+    assert lines[-3:] == [
+        "Result: 1 of 1 call repaired.",
+        f"Wrote the accepted patches to {out}.",
+        f"Wrote json report to {report}.",
+    ]
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["patches"][0]["add_system"] == "Reply with the label only."
+    assert json.loads(report.read_text(encoding="utf-8"))["calls"][0]["status"] == "REPAIRED"
+    # The accepted patch is an ordinary patch file.
+    args = ["test", str(suite_file), "--from", "ollama/old", "--to", "ollama/new", "--no-judge"]
+    assert runner.invoke(app, [*args, "--patch", str(out)]).exit_code == 0
+
+
+def test_repair_run_without_a_safe_patch_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    suite_file, proposals = _demo_proposals(monkeypatch, tmp_path, ["Be nice."])
+    _fake_models(monkeypatch, broken="crashes")
+    out = tmp_path / "repair.json"
+    args = ["repair", "run", str(suite_file), str(proposals), "--from", "ollama/old"]
+    result = runner.invoke(app, [*args, "--to", "ollama/new", "--output", str(out)])
+    assert result.exit_code == 1
+    assert "NOT REPAIRED  support.py:24  (3 test cases)" in result.stdout
+    assert result.stdout.splitlines()[-1] == "Result: 0 of 1 call repaired."
+    assert not out.exists()
+
+
+def test_repair_run_errors(tmp_path: Path) -> None:
+    suite_file = _demo_suite(tmp_path)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    args = ["repair", "run", str(suite_file), str(empty), "--from", "ollama/a", "--to", "ollama/b"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2
+    assert "has no proposals.json" in result.stderr
+    (empty / "proposals.json").write_text('{"version": 1, "calls": []}', encoding="utf-8")
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0
+    assert result.stdout == "No calls to repair in the proposals.\n"
+
+
+def test_repair_propose_naive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    suite_file, report = _demo_report(monkeypatch, tmp_path)
+    good = json.dumps({"add_system": "Use one word.", "edits": [], "why": "w"})
+    seen = _fake_proposer(monkeypatch, [good])
+    out = tmp_path / "naive"
+    args = ["repair", "propose", str(suite_file), str(report), "--candidates", "1"]
+    result = runner.invoke(app, [*args, "--strategy", "naive", "--output-dir", str(out)])
+    assert result.exit_code == 0, result.output
+    assert "works well with ollama/new" in str(seen[0]["messages"])
+    assert json.loads((out / "proposals.json").read_text(encoding="utf-8"))["strategy"] == "naive"
+
+
+def test_repair_propose_iterative_scores_its_candidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    suite_file, report = _demo_report(monkeypatch, tmp_path)
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert (data["old_think"], data["new_think"]) == (None, None)
+    proposals = iter(["Be nice.", "Reply with the label only."])
+    seen: list[dict[str, object]] = []
+
+    def server(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        system = body["messages"][0]["content"]
+        prompt = body["messages"][-1]["content"]
+        if system.startswith("You fix prompts"):
+            text = json.dumps({"add_system": next(proposals), "edits": [], "why": "w"})
+        else:
+            wrong = "crashes" in prompt and body["model"] == "new" and "label only" not in system
+            text = "feature" if wrong else "bug"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            },
+        )
+
+    real_init = Runner.__init__
+
+    def init_with_fake_server(self: Runner, **options: object) -> None:
+        real_init(self, transport=httpx.MockTransport(server), **options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Runner, "__init__", init_with_fake_server)
+    out = tmp_path / "iterative"
+    args = ["repair", "propose", str(suite_file), str(report), "--strategy", "iterative"]
+    result = runner.invoke(
+        app, [*args, "--rounds", "2", "--per-round", "1", "--output-dir", str(out)]
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[0] == "support.py:24: 2 candidates, 0 refused"
+    summary = json.loads((out / "proposals.json").read_text(encoding="utf-8"))
+    trace = summary["calls"][0]["trace"]
+    assert [(t["round"], round(t["screen_mean"], 2)) for t in trace] == [(0, 0.67), (1, 1.0)]
+    asked = [b for b in seen if str(b["messages"]).count("You fix prompts")]
+    assert '- score 0.67: add_system \\"Be nice.\\"' in json.dumps(asked[1]["messages"])
+
+
+def test_repair_propose_iterative_needs_the_test_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    suite_file, report = _demo_report(monkeypatch, tmp_path)
+    data = json.loads(report.read_text(encoding="utf-8"))
+    del data["max_tokens"]
+    report.write_text(json.dumps(data), encoding="utf-8")
+    args = ["repair", "propose", str(suite_file), str(report), "--strategy", "iterative"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 2
+    assert "the report has no 'max_tokens' setting" in result.stderr
 
 
 def test_test_budget_says_how_to_continue(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

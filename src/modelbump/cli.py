@@ -28,6 +28,29 @@ from modelbump.oracles.probes import (
 from modelbump.oracles.probes import DEFAULT_SEED as DEFAULT_PROBE_SEED
 from modelbump.oracles.report import oracles_summary, render_oracles_json, render_oracles_text
 from modelbump.registry import Status, load_registry
+from modelbump.repair import (
+    DEFAULT_CANDIDATES,
+    DEFAULT_PROPOSER,
+    apply_patches,
+    call_of,
+    patch_diff,
+    patches_to_json,
+    propose,
+    read_patches,
+    write_proposals,
+)
+from modelbump.repair.loop import (
+    DEFAULT_CONFIRM_RUNS,
+    DEFAULT_CONFIRM_TOP,
+    DEFAULT_MAX_GAP,
+    DEFAULT_SCREEN_RUNS,
+    LoopSettings,
+    read_candidates,
+    repair_suite,
+)
+from modelbump.repair.optimize import DEFAULT_PER_ROUND, DEFAULT_ROUNDS, optimize
+from modelbump.repair.propose import Strategy
+from modelbump.repair.report import render_repair_json, render_repair_text
 from modelbump.runner import (
     Budget,
     BudgetExceeded,
@@ -60,7 +83,7 @@ from modelbump.stats import (
     run_suite,
     simulated_suite,
 )
-from modelbump.suite import Method, Settings, build_suite, read_suite, suite_to_json
+from modelbump.suite import Method, Settings, Suite, build_suite, read_suite, suite_to_json
 from modelbump.suite.report import render_run_json, render_run_text, run_summary
 from modelbump.suite.run import (
     DEFAULT_MAX_TOKENS,
@@ -408,6 +431,32 @@ def suite(
         typer.echo(f"  left out {where}: {reason}")
 
 
+def _pinned(settings: Settings, cases: Suite, judge: str, no_judge: bool) -> Settings:
+    """The settings with the judge chosen and each model pinned to its version.
+
+    The judge is used only when the suite has free-text cases. Prints the
+    privacy note when a model is on a free cloud tier.
+    """
+    has_text = any(c.oracle.kind is OutputKind.TEXT for c in cases.cases)
+    judge_model = None if no_judge or not has_text else judge
+    names = [settings.old, settings.new] + ([judge_model] if judge_model is not None else [])
+    endpoints = [resolve_model(model_name)[0] for model_name in names]
+    probes = pin_versions([ChatRequest.ask(name, "version") for name in names])
+    if not all(endpoint.local for endpoint in endpoints):
+        typer.echo(
+            "Note: a free cloud tier is in use. The app's prompts leave this machine "
+            "and may be kept or read by the provider. Never send private code.",
+            err=True,
+        )
+    return replace(
+        settings,
+        old_version=probes[0].model_version,
+        new_version=probes[1].model_version,
+        judge=judge_model,
+        judge_version=probes[2].model_version if judge_model is not None else "",
+    )
+
+
 @app.command("test")
 def test_models(
     suite_file: Annotated[
@@ -463,6 +512,14 @@ def test_models(
         Path | None,
         typer.Option(help="Write the report to this file instead of the screen.", dir_okay=False),
     ] = None,
+    patch: Annotated[
+        Path | None,
+        typer.Option(
+            help="A patch file: the new model gets the patched prompts (ADR 0062).",
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
 ) -> None:
     """Run a suite on the old and the new model and decide each test case.
 
@@ -470,6 +527,7 @@ def test_models(
     """
     try:
         cases_to_run = read_suite(suite_file)
+        patched = None if patch is None else apply_patches(cases_to_run, read_patches(patch))
         settings = Settings(
             old=old,
             new=new,
@@ -481,38 +539,18 @@ def test_models(
             old_think=from_think,
             new_think=to_think,
         )
-        has_text = any(c.oracle.kind is OutputKind.TEXT for c in cases_to_run.cases)
-        judge_model = None if no_judge or not has_text else judge
-        names = [old, new] + ([judge_model] if judge_model is not None else [])
-        endpoints = [resolve_model(model_name)[0] for model_name in names]
-        probes = pin_versions([ChatRequest.ask(name, "version") for name in names])
-    except ValueError as error:
-        typer.echo(f"Error: {error}", err=True)
-        raise typer.Exit(code=2) from error
-    except RunnerError as error:
+        settings = _pinned(settings, cases_to_run, judge, no_judge)
+    except (ValueError, RunnerError) as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=2) from error
     if not cases_to_run.cases:
         typer.echo("Error: the suite has no test cases.", err=True)
         raise typer.Exit(code=2)
-    if not all(endpoint.local for endpoint in endpoints):
-        typer.echo(
-            "Note: a free cloud tier is in use. The app's prompts leave this machine "
-            "and may be kept or read by the provider. Never send private code.",
-            err=True,
-        )
-    settings = replace(
-        settings,
-        old_version=probes[0].model_version,
-        new_version=probes[1].model_version,
-        judge=judge_model,
-        judge_version=probes[2].model_version if judge_model is not None else "",
-    )
     cache = ResponseCache()
     budget = Budget(max_requests=budget_requests)
     runner = Runner(cache=cache, budget=budget)
     try:
-        result = asyncio.run(run_suite_on_models(cases_to_run, runner, settings))
+        result = asyncio.run(run_suite_on_models(cases_to_run, runner, settings, patched))
     finally:
         cache.close()
     render = render_run_json if output_format is PromptFormat.JSON else render_run_text
@@ -744,6 +782,343 @@ def cache_clear(
     finally:
         cache.close()
     typer.echo(f"Deleted {deleted} stored answers.")
+
+
+repair_app = typer.Typer(
+    help="Patch an app's prompts so the new model does the job again.", no_args_is_help=True
+)
+app.add_typer(repair_app, name="repair")
+
+
+def _patched(suite_file: Path, patch_file: Path) -> tuple[Suite, Suite]:
+    try:
+        before = read_suite(suite_file)
+        return before, apply_patches(before, read_patches(patch_file))
+    except ValueError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+
+
+@repair_app.command("show")
+def repair_show(
+    suite_file: Annotated[
+        Path,
+        typer.Argument(help="The suite file from `modelbump suite`.", exists=True, dir_okay=False),
+    ],
+    patch_file: Annotated[
+        Path,
+        typer.Argument(help="The patch file to check.", exists=True, dir_okay=False),
+    ],
+) -> None:
+    """Show what a patch changes in each test case, without asking any model.
+
+    Exits with 2 when the patch does not fit the suite.
+    """
+    before, after = _patched(suite_file, patch_file)
+    changed = 0
+    calls: set[str] = set()
+    single: set[str] = set()
+    per_call = Counter(call_of(case) for case in before.cases)
+    for old, new in zip(before.cases, after.cases, strict=True):
+        if old.messages == new.messages:
+            continue
+        changed += 1
+        calls.add(call_of(old))
+        if per_call[call_of(old)] == 1:
+            single.add(call_of(old))
+        typer.echo(patch_diff(old, new))
+        typer.echo("")
+    typer.echo(
+        f"The patch changes {changed} test {'case' if changed == 1 else 'cases'} "
+        f"in {len(calls)} LLM {'call' if len(calls) == 1 else 'calls'}."
+    )
+    for call in sorted(single):
+        typer.echo(
+            f"  {call} has one test case, so an edit there could touch its inputs: check the diff."
+        )
+
+
+def _report_settings(
+    report: dict[str, object], from_think: str | None, to_think: str | None
+) -> Settings:
+    """The test's settings, read back from its JSON report, to repeat its answers."""
+    try:
+        return Settings(
+            old=str(report["old"]),
+            new=str(report["new"]),
+            reference=int(str(report["reference"])),
+            temperature=float(str(report["temperature"])),
+            max_tokens=int(str(report["max_tokens"])),
+            old_think=from_think if from_think is not None else _optional(report.get("old_think")),
+            new_think=to_think if to_think is not None else _optional(report.get("new_think")),
+        )
+    except KeyError as error:
+        raise ValueError(
+            f"the report has no {error} setting: use `modelbump test --format json`"
+        ) from error
+
+
+def _optional(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+@repair_app.command("propose")
+def repair_propose(
+    suite_file: Annotated[
+        Path,
+        typer.Argument(help="The suite file from `modelbump suite`.", exists=True, dir_okay=False),
+    ],
+    report_file: Annotated[
+        Path,
+        typer.Argument(
+            help="A `modelbump test --format json` report of that suite, run without a patch.",
+            exists=True,
+            dir_okay=False,
+        ),
+    ],
+    model: Annotated[
+        str, typer.Option(help="The model that writes candidate patches, as endpoint/model.")
+    ] = DEFAULT_PROPOSER,
+    candidates: Annotated[
+        int, typer.Option(min=1, help="Answers asked per call; each can give one candidate.")
+    ] = DEFAULT_CANDIDATES,
+    output_dir: Annotated[
+        Path,
+        typer.Option(
+            help="Folder for the candidate patch files and proposals.json.", file_okay=False
+        ),
+    ] = Path("modelbump-proposals"),
+    strategy: Annotated[
+        Strategy,
+        typer.Option(
+            help="evidence (from the failing answers), or the baselines naive and iterative."
+        ),
+    ] = Strategy.EVIDENCE,
+    rounds: Annotated[
+        int, typer.Option(min=1, help="iterative: rounds of proposals.")
+    ] = DEFAULT_ROUNDS,
+    per_round: Annotated[
+        int, typer.Option(min=1, help="iterative: proposals per round.")
+    ] = DEFAULT_PER_ROUND,
+    screen_runs: Annotated[
+        int, typer.Option(min=1, help="iterative: answers per case to score each candidate.")
+    ] = DEFAULT_SCREEN_RUNS,
+    from_think: Annotated[
+        str | None,
+        typer.Option(help="iterative: reasoning effort for the old model, if the report has none."),
+    ] = None,
+    to_think: Annotated[
+        str | None,
+        typer.Option(help="iterative: reasoning effort for the new model, e.g. none for Qwen 3."),
+    ] = None,
+) -> None:
+    """Ask a model for candidate patches for every call with a REGRESSED case (ADR 0063).
+
+    Each candidate is a patch file you can check with `repair show` and test with
+    `modelbump test --patch`. Nothing here says a candidate works. The naive and
+    iterative strategies are the baselines of ADR 0065; iterative also asks the
+    old and new models from the report, to score its candidates.
+    """
+    settings = None
+    try:
+        suite_data = read_suite(suite_file)
+        report = json.loads(report_file.read_text(encoding="utf-8"))
+        endpoint, _ = resolve_model(model)
+        version = pin_versions([ChatRequest.ask(model, "version")])[0].model_version
+        if strategy is Strategy.ITERATIVE:
+            settings = _pinned(
+                _report_settings(report, from_think, to_think),
+                suite_data,
+                str(report.get("judge") or DEFAULT_JUDGE),
+                no_judge=not report.get("judge"),
+            )
+    except (ValueError, RunnerError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    if not endpoint.local:
+        typer.echo(
+            "Note: a free cloud tier is in use. The app's prompts leave this machine "
+            "and may be kept or read by the provider. Never send private code.",
+            err=True,
+        )
+    cache = ResponseCache()
+    budget = Budget()
+    runner = Runner(cache=cache, budget=budget)
+    try:
+        if settings is not None:
+            results = asyncio.run(
+                optimize(
+                    suite_data,
+                    report,
+                    runner,
+                    settings,
+                    model=model,
+                    rounds=rounds,
+                    per_round=per_round,
+                    screen_runs=screen_runs,
+                    model_version=version,
+                )
+            )
+        else:
+            results = asyncio.run(
+                propose(
+                    suite_data,
+                    report,
+                    runner,
+                    model=model,
+                    count=candidates,
+                    model_version=version,
+                    strategy=strategy,
+                )
+            )
+    except ValueError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    finally:
+        cache.close()
+    if not results:
+        typer.echo("No case REGRESSED in the report: nothing to repair.")
+        return
+    write_proposals(results, output_dir, model, version, strategy)
+    total = 0
+    for result in results:
+        found = len(result.candidates)
+        total += found
+        only = "" if result.evidence.edits_allowed else " (one test case: add_system only)"
+        typer.echo(
+            f"{result.evidence.call}: {found} {'candidate' if found == 1 else 'candidates'}, "
+            f"{len(result.refused)} refused{only}"
+        )
+        for sample, reason in result.refused:
+            typer.echo(f"  sample {sample} refused: {reason}")
+    typer.echo(
+        f"Wrote {total} candidate {'patch' if total == 1 else 'patches'} for "
+        f"{len(results)} {'call' if len(results) == 1 else 'calls'} to {output_dir}."
+    )
+    typer.echo(budget.summary(), err=True)
+
+
+@repair_app.command("run")
+def repair_run(
+    suite_file: Annotated[
+        Path,
+        typer.Argument(help="The suite file from `modelbump suite`.", exists=True, dir_okay=False),
+    ],
+    proposals: Annotated[
+        Path,
+        typer.Argument(
+            help="The folder `modelbump repair propose` wrote.", exists=True, file_okay=False
+        ),
+    ],
+    old: Annotated[
+        str, typer.Option("--from", help="The model the app uses now, as endpoint/model.")
+    ],
+    new: Annotated[str, typer.Option("--to", help="The model to move to, as endpoint/model.")],
+    screen_runs: Annotated[
+        int, typer.Option(min=1, help="Answers per case for each candidate when screening.")
+    ] = DEFAULT_SCREEN_RUNS,
+    confirm_runs: Annotated[
+        int, typer.Option(min=1, help="Fresh answers per model per case when confirming.")
+    ] = DEFAULT_CONFIRM_RUNS,
+    confirm_top: Annotated[
+        int,
+        typer.Option(
+            min=1, help="Best candidates to confirm per call (alpha is split among them)."
+        ),
+    ] = DEFAULT_CONFIRM_TOP,
+    alpha: Annotated[
+        float, typer.Option(help="Chance per call of accepting a patch that breaks a case.")
+    ] = DEFAULT_ALPHA,
+    margin: Annotated[
+        float, typer.Option(help="How much worse than the old model still counts as fine.")
+    ] = DEFAULT_MARGIN,
+    max_gap: Annotated[
+        float,
+        typer.Option(help="Do not confirm a candidate that screens this far below the old model."),
+    ] = DEFAULT_MAX_GAP,
+    reference: Annotated[
+        int,
+        typer.Option(min=1, help="Old-model answers per case that set the reference (not scored)."),
+    ] = DEFAULT_REFERENCE,
+    from_think: Annotated[
+        str | None,
+        typer.Option(help="Reasoning effort for the --from model: none, low, medium or high."),
+    ] = None,
+    to_think: Annotated[
+        str | None,
+        typer.Option(help="Reasoning effort for the --to model, e.g. none for Qwen 3."),
+    ] = None,
+    temperature: Annotated[
+        float, typer.Option(min=0.0, help="Sampling temperature for both models.")
+    ] = DEFAULT_TEMPERATURE,
+    max_tokens: Annotated[
+        int, typer.Option(min=1, help="Longest answer, in tokens.")
+    ] = DEFAULT_MAX_TOKENS,
+    judge: Annotated[
+        str,
+        typer.Option(help="The model that judges free-text answers, as endpoint/model."),
+    ] = DEFAULT_JUDGE,
+    no_judge: Annotated[
+        bool,
+        typer.Option("--no-judge", help="Check free text with property checks only."),
+    ] = False,
+    budget_requests: Annotated[
+        int | None,
+        typer.Option(min=1, help="Stop after this many requests (cached answers are free)."),
+    ] = None,
+    output: Annotated[
+        Path,
+        typer.Option(help="Patch file for the accepted patches.", dir_okay=False),
+    ] = Path("modelbump-repair.json"),
+    report: Annotated[
+        Path | None,
+        typer.Option(help="Also write the full JSON report to this file.", dir_okay=False),
+    ] = None,
+) -> None:
+    """Screen the candidate patches, confirm the best on fresh answers, keep only safe ones.
+
+    A patch is accepted only if, on every test case of its call, the patched new
+    model is shown to be no more than --margin worse than the old model (ADR 0064).
+    Exits with 1 when a call could not be repaired.
+    """
+    try:
+        cases_to_run = read_suite(suite_file)
+        calls = read_candidates(proposals, cases_to_run)
+        loop = LoopSettings(screen_runs, confirm_runs, confirm_top, alpha, margin, max_gap)
+        settings = Settings(
+            old=old,
+            new=new,
+            reference=reference,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            old_think=from_think,
+            new_think=to_think,
+        )
+        settings = _pinned(settings, cases_to_run, judge, no_judge)
+    except (ValueError, RunnerError) as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=2) from error
+    if not calls:
+        typer.echo("No calls to repair in the proposals.")
+        return
+    cache = ResponseCache()
+    budget = Budget(max_requests=budget_requests)
+    runner = Runner(cache=cache, budget=budget)
+    try:
+        results = asyncio.run(repair_suite(cases_to_run, calls, runner, settings, loop))
+    finally:
+        cache.close()
+    typer.echo(render_repair_text(results, settings, loop), nl=False)
+    accepted = tuple(r.patch for r in results if r.patch is not None)
+    if accepted:
+        output.write_text(patches_to_json(accepted), encoding="utf-8")
+        typer.echo(f"Wrote the accepted patches to {output}.")
+    if report is not None:
+        report.write_text(render_repair_json(results, settings, loop), encoding="utf-8")
+        typer.echo(f"Wrote json report to {report}.")
+    typer.echo(budget.summary(), err=True)
+    if len(accepted) < len(results):
+        raise typer.Exit(code=1)
 
 
 judge_app = typer.Typer(
