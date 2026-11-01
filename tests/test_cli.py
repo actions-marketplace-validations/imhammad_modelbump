@@ -1522,3 +1522,230 @@ def test_judge_probes_and_probe_check_end_to_end(
     again = runner.invoke(app, ["judge", "probes", str(tmp_path / "suite.json")])
     assert again.exit_code == 2
     assert "is from an older ModelBump" in again.output or "not a" in again.output
+
+
+def test_bump_shows_a_diff_and_writes_nothing_by_default(tmp_path: Path) -> None:
+    app_file = tmp_path / "app.py"
+    app_file.write_text('MODEL = "claude-3-haiku-20240307"\n# claude-3-haiku-20240307\n')
+    result = runner.invoke(app, ["bump", "claude-3-haiku-20240307", str(tmp_path)])
+    assert result.exit_code == 0
+    assert result.stdout.splitlines() == [
+        "Using the replacement the registry suggests: claude-haiku-4-5-20251001.",
+        "--- a/app.py",
+        "+++ b/app.py",
+        "@@ -1,2 +1,2 @@",
+        '-MODEL = "claude-3-haiku-20240307"',
+        '+MODEL = "claude-haiku-4-5-20251001"',
+        " # claude-3-haiku-20240307",
+        "Would change 1 place in 1 file: claude-3-haiku-20240307 -> claude-haiku-4-5-20251001.",
+        "Left alone, check by hand (1):",
+        "  app.py:2:3  claude-3-haiku-20240307  "
+        "(comment, docstring or sentence; --include-docs changes these too)",
+        "Tip: 1 place hard-codes the model. Add --env ANTHROPIC_MODEL to read it from the "
+        "environment, so the next change is one setting.",
+        "Nothing was written. Run again with --write to change the files.",
+    ]
+    assert "claude-3-haiku-20240307" in app_file.read_text().splitlines()[0]
+
+
+def test_bump_write_changes_the_files(tmp_path: Path) -> None:
+    app_file = tmp_path / "app.py"
+    app_file.write_text('MODEL = "gpt-4o"\n')
+    result = runner.invoke(app, ["bump", "gpt-4o", str(tmp_path), "--to", "gpt-6-sol", "--write"])
+    assert result.exit_code == 0
+    assert result.stdout.splitlines()[0] == "Changed 1 place in 1 file: gpt-4o -> gpt-6-sol."
+    assert app_file.read_text() == 'MODEL = "gpt-6-sol"\n'
+
+
+def test_bump_with_nothing_to_change(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text('MODEL = "gpt-4o"\n')
+    result = runner.invoke(app, ["bump", "gpt-4o-mini", str(tmp_path), "--to", "gpt-6-sol"])
+    assert result.exit_code == 0
+    assert result.stdout == ("No place that uses gpt-4o-mini needs a change (scanned 1 file).\n")
+
+
+def test_bump_needs_to_when_the_registry_has_no_replacement(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["bump", "gpt-5.4-cyber", str(tmp_path)])
+    assert result.exit_code == 2
+    assert "suggests no replacement for gpt-5.4-cyber; pass --to" in result.stderr
+    result = runner.invoke(app, ["bump", "gpt-4o", str(tmp_path)])
+    assert result.exit_code == 2
+    assert "gpt-4o is not in the registry, so there is no suggested replacement" in result.stderr
+
+
+def test_bump_refuses_a_retired_target(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["bump", "gpt-4o", str(tmp_path), "--to", "claude-3-haiku-20240307"]
+    )
+    assert result.exit_code == 2
+    assert "claude-3-haiku-20240307 shut down on 2026-04-20; pick another model." in result.stderr
+
+
+def test_bump_warns_about_a_deprecated_target(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text('MODEL = "gpt-4o"\n')
+    result = runner.invoke(
+        app, ["bump", "gpt-4o", str(tmp_path), "--to", "gpt-5.1", "--today", "2026-10-22"]
+    )
+    assert result.exit_code == 0
+    assert result.stdout.startswith(
+        "Warning: gpt-5.1 is deprecated too and shuts down on 2027-04-01.\n"
+    )
+
+
+def test_bump_refuses_a_new_id_that_is_not_a_model_id(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["bump", "gpt-4o", str(tmp_path), "--to", 'x"; import os'])
+    assert result.exit_code == 2
+    assert "does not look like a model ID" in result.stderr
+
+
+def test_bump_env_reads_the_model_from_the_environment(tmp_path: Path) -> None:
+    app_file = tmp_path / "app.py"
+    app_file.write_text('MODEL = "gpt-4o"\n')
+    result = runner.invoke(
+        app,
+        ["bump", "gpt-4o", str(tmp_path), "--to", "gpt-6-sol", "--env", "OPENAI_MODEL", "--write"],
+    )
+    assert result.exit_code == 0
+    assert result.stdout == (
+        "Changed 1 place in 1 file: gpt-4o -> gpt-6-sol. "
+        "1 now reads OPENAI_MODEL (added to .env.example).\n"
+    )
+    assert (
+        app_file.read_text() == 'import os\nMODEL = os.environ.get("OPENAI_MODEL", "gpt-6-sol")\n'
+    )
+    assert (tmp_path / ".env.example").read_text() == "OPENAI_MODEL=gpt-6-sol\n"
+
+
+def test_bump_refuses_a_bad_env_name(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["bump", "gpt-4o", str(tmp_path), "--to", "gpt-6-sol", "--env", "x y"]
+    )
+    assert result.exit_code == 2
+    assert "not an environment variable name" in result.stderr
+
+
+def test_bump_adds_evidence_and_writes_repairs(tmp_path: Path) -> None:
+    import shutil
+
+    app_dir = tmp_path / "app"
+    shutil.copytree(DEMO, app_dir)
+    suite_file = tmp_path / "suite.json"
+    assert runner.invoke(app, ["suite", str(app_dir), "--output", str(suite_file)]).exit_code == 0
+    report = tmp_path / "test.json"
+    report.write_text(json.dumps({"version": 1, "old": "ollama/a", "new": "ollama/b", "cases": []}))
+    fix = tmp_path / "fix.json"
+    fix.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "patches": [
+                    {"call": "support.py:30", "add_system": "No numbered lists."},
+                    {"call": "support.py:24", "add_system": "Label only."},
+                ],
+            }
+        )
+    )
+    args = ["bump", "gpt-4o-mini", str(app_dir), "--to", "gpt-6-sol", "--suite", str(suite_file)]
+    args += ["--report", str(report), "--patch", str(fix)]
+    result = runner.invoke(app, [*args, "--write"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[:9] == [
+        "Changed 2 places in 2 files: gpt-4o-mini -> gpt-6-sol.",
+        "Repaired the prompt of 1 call in the code: support.py:30.",
+        "Apply by hand (1); the patch is in .modelbump/repairs.json:",
+        "  support.py:24  (the system message is built at runtime)",
+        "Added evidence, tested ollama/a -> ollama/b:",
+        "  .modelbump/suite.json",
+        "  .modelbump/test.json",
+        "  .modelbump/repairs.json",
+        "Tip: 1 place hard-codes the model. Add --env LLM_MODEL to read it from the "
+        "environment, so the next change is one setting.",
+    ]
+    assert "No numbered lists." in (app_dir / "support.py").read_text()
+
+
+def test_bump_says_what_it_redacted_from_the_evidence(tmp_path: Path) -> None:
+    import shutil
+
+    app_dir = tmp_path / "app"
+    shutil.copytree(DEMO, app_dir)
+    suite_file = tmp_path / "suite.json"
+    assert runner.invoke(app, ["suite", str(app_dir), "--output", str(suite_file)]).exit_code == 0
+    report = tmp_path / "test.json"
+    case = {"id": "a.py:1#1", "verdict": None, "error": "denied for jane@corp.io"}
+    report.write_text(
+        json.dumps({"version": 1, "old": "ollama/a", "new": "ollama/b", "cases": [case]})
+    )
+    args = ["bump", "gpt-4o-mini", str(app_dir), "--to", "gpt-6-sol", "--suite", str(suite_file)]
+    result = runner.invoke(app, [*args, "--report", str(report), "--write"])
+    assert result.exit_code == 0, result.output
+    assert "Redacted from the evidence: 1 email address." in result.stdout
+    assert "jane@corp.io" not in (app_dir / ".modelbump" / "test.json").read_text()
+
+
+def test_bump_suggests_the_id_that_was_meant(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text('MODEL = "gpt-4o-mini"\n')
+    result = runner.invoke(app, ["bump", "gpt-4o-minii", str(tmp_path)])
+    assert result.exit_code == 2
+    assert result.stderr == (
+        "gpt-4o-minii is not in the registry, so there is no suggested replacement; "
+        "pass --to. Did you mean gpt-4o-mini?\n"
+    )
+    result = runner.invoke(app, ["bump", "claude-3-haiku-2024037", str(tmp_path), "--to", "x-1"])
+    assert result.exit_code == 0
+    assert result.stdout == (
+        "No place that uses claude-3-haiku-2024037 needs a change (scanned 1 file). "
+        "Did you mean claude-3-haiku-20240307?\n"
+    )
+
+
+def test_bump_says_when_a_file_cannot_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import modelbump.cli
+
+    def refuse(root: Path, plan: object) -> None:
+        raise PermissionError(13, "Permission denied", str(tmp_path / "app.py"))
+
+    monkeypatch.setattr(modelbump.cli, "apply_plan", refuse)
+    (tmp_path / "app.py").write_text('MODEL = "gpt-4o"\n')
+    result = runner.invoke(app, ["bump", "gpt-4o", str(tmp_path), "--to", "gpt-6-sol", "--write"])
+    assert result.exit_code == 1
+    assert result.stderr == f"Error: cannot write {tmp_path / 'app.py'}: Permission denied.\n"
+
+
+def test_bump_report_needs_a_suite(tmp_path: Path) -> None:
+    report = tmp_path / "test.json"
+    report.write_text("{}")
+    result = runner.invoke(
+        app, ["bump", "gpt-4o", str(tmp_path), "--to", "gpt-6-sol", "--report", str(report)]
+    )
+    assert result.exit_code == 2
+    assert "need --suite" in result.stderr
+
+
+def test_bump_writes_the_pull_request_description(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text('MODEL = "gpt-4o"\n')
+    body = tmp_path / "body.md"
+    result = runner.invoke(
+        app, ["bump", "gpt-4o", str(tmp_path), "--to", "gpt-6-sol", "--pr-body", str(body)]
+    )
+    assert result.exit_code == 0
+    assert f"Wrote the pull request description to {body}." in result.stdout
+    assert body.read_text().startswith("## Bump `gpt-4o` to `gpt-6-sol`\n")
+    assert (tmp_path / "app.py").read_text() == 'MODEL = "gpt-4o"\n'
+
+
+def test_bump_open_pr_outside_a_git_repository_changes_nothing(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text('MODEL = "gpt-4o"\n')
+    result = runner.invoke(app, ["bump", "gpt-4o", str(tmp_path), "--to", "gpt-6-sol", "--open-pr"])
+    assert result.exit_code == 2
+    # No gh here, or no git repository: either way it stops before writing.
+    assert "needs the GitHub CLI" in result.stderr or "not a git repository" in result.stderr
+    assert (tmp_path / "app.py").read_text() == 'MODEL = "gpt-4o"\n'
+
+
+def test_bump_open_pr_with_nothing_to_change(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["bump", "gpt-4o", str(tmp_path), "--to", "gpt-6-sol", "--open-pr"])
+    assert result.exit_code == 0
+    assert "Nothing to change, so no pull request was opened." in result.stdout

@@ -122,12 +122,15 @@ jobs:
 | `skip-comments` | `false` | Leave out IDs that only describe a model (comments, docstrings, sentences, price tables) |
 | `skip-tests` | `false` | Leave out test files and test folders |
 | `upload-sarif` | `true` | Upload the findings to code scanning (needs `security-events: write`; private repositories also need GitHub Advanced Security) |
+| `open-prs` | `false` | `true` opens one bump pull request per due model, `dry-run` lists them ([Bump](bump.md#every-due-model-on-a-schedule)) |
+| `within` | `90` | With `open-prs`: bump models that shut down within this many days |
+| `github-token` | `github.token` | Token `gh` uses to open the pull requests |
 
 The findings appear in the Security tab and on pull request lines, and the text report appears in the job summary.
 
 ## Files scanned
 
-Code (`.py`, `.ipynb`, `.js`, `.ts`, `.tsx`, `.go`, `.java`, `.ex`, `.exs`, `.html`, ...) and config (`.json`, `.yaml`, `.toml`, `.ini`, `.env`, `.env.example`, `env.example`, ...). Docs, lock files, tool folders (`.git`, `node_modules`, `.venv`, ...), symbolic links, files over 1 MB and binary files are skipped. A file named directly on the command line is always scanned. `--exclude PATTERN` (repeatable) skips more: `tests` drops that folder, `*.ipynb` drops every notebook, and `*/fixtures` drops fixtures folders at any depth.
+Code (`.py`, `.ipynb`, `.js`, `.ts`, `.tsx`, `.go`, `.java`, `.ex`, `.exs`, `.html`, ...) and config (`.json`, `.yaml`, `.toml`, `.ini`, `.env`, `.env.example`, `env.example`, ...). Docs, lock files, tool folders (`.git`, `node_modules`, `.venv`, ...), ModelBump's own `.modelbump` evidence folder, symbolic links, files over 1 MB and binary files are skipped. A file named directly on the command line is always scanned. `--exclude PATTERN` (repeatable) skips more: `tests` drops that folder, `*.ipynb` drops every notebook, and `*/fixtures` drops fixtures folders at any depth.
 
 ## Not yet
 

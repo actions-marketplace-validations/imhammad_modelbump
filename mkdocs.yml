@@ -57,6 +57,7 @@ nav:
       - architecture/oracles.md
       - architecture/suite.md
       - architecture/repair.md
+      - architecture/bump.md
   - Decisions (ADRs):
       - adr/index.md
       - adr/0001-python-uv-src-layout.md
@@ -126,6 +127,12 @@ nav:
       - adr/0065-repair-baselines.md
       - adr/0066-rq3-repair-experiment.md
       - adr/0067-instruct-model-and-salvaged-proposals.md
+      - adr/0068-bump-rewrites-ids-the-scanner-found.md
+      - adr/0069-move-hard-coded-ids-to-an-environment-variable.md
+      - adr/0070-bump-adds-evidence-and-writes-repairs-into-the-code.md
+      - adr/0071-pull-request-with-the-evidence-report.md
+      - adr/0072-scheduled-bump-pull-requests.md
+      - adr/0073-redact-evidence-and-scan-large-repositories-fast.md
   - Engineering challenges:
       - engineering-challenges/index.md
       - engineering-challenges/001-release-pr-ci-never-runs.md

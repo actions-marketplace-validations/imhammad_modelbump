@@ -1,6 +1,7 @@
 """Command-line interface for ModelBump."""
 
 import asyncio
+import difflib
 import json
 import random
 from collections import Counter
@@ -12,6 +13,27 @@ from typing import Annotated
 import typer
 
 from modelbump import __version__
+from modelbump.bump import (
+    DEFAULT_WITHIN,
+    EVIDENCE_DIR,
+    BranchExists,
+    BumpError,
+    BumpPlan,
+    apply_plan,
+    branch_name,
+    check_repo,
+    due_line,
+    due_models,
+    load_evidence,
+    open_pr,
+    plan_bump,
+    plan_diff,
+    pr_body,
+    pr_title,
+    skipped_lines,
+    suggested_env_name,
+)
+from modelbump.bump.redact import summary as redacted_summary
 from modelbump.oracles import OutputKind
 from modelbump.oracles.calibrate import DEFAULT_SEED as DEFAULT_SHEET_SEED
 from modelbump.oracles.calibrate import DEFAULT_SIZE as DEFAULT_SHEET_SIZE
@@ -27,7 +49,7 @@ from modelbump.oracles.probes import (
 )
 from modelbump.oracles.probes import DEFAULT_SEED as DEFAULT_PROBE_SEED
 from modelbump.oracles.report import oracles_summary, render_oracles_json, render_oracles_text
-from modelbump.registry import Status, load_registry
+from modelbump.registry import Registry, Status, load_registry
 from modelbump.repair import (
     DEFAULT_CANDIDATES,
     DEFAULT_PROPOSER,
@@ -63,7 +85,7 @@ from modelbump.runner import (
     pin_versions,
     resolve_model,
 )
-from modelbump.scanner import DEFAULT_SOON_DAYS, scan_path
+from modelbump.scanner import DEFAULT_SOON_DAYS, Severity, assess, scan_path
 from modelbump.scanner.report import (
     RENDERERS,
     OutputFormat,
@@ -234,6 +256,362 @@ def check(
         typer.echo(f"Rescheduled: {len(model.superseded)} earlier plan(s) were replaced.")
     if model.replacement:
         typer.echo(f"Suggested replacement: {model.replacement}")
+
+
+@app.command()
+def bump(
+    old: Annotated[str, typer.Argument(help="Model ID to move away from, e.g. gpt-4o-mini.")],
+    path: Annotated[
+        Path,
+        typer.Argument(help="Folder or file to change.", exists=True, resolve_path=True),
+    ] = Path("."),
+    to: Annotated[
+        str | None,
+        typer.Option(
+            "--to",
+            help="Model ID to move to. Default: the replacement the registry suggests.",
+        ),
+    ] = None,
+    write: Annotated[
+        bool,
+        typer.Option(help="Change the files. Without it, only show what would change."),
+    ] = False,
+    include_docs: Annotated[
+        bool,
+        typer.Option(help="Also change comments, docstrings and sentences that name the model."),
+    ] = False,
+    env: Annotated[
+        str | None,
+        typer.Option(
+            help="Read the model from this environment variable, e.g. OPENAI_MODEL, with the "
+            "new model as the default (Python code; also added to .env.example).",
+        ),
+    ] = None,
+    suite_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--suite",
+            help="The suite that was tested (`modelbump suite`), added as evidence.",
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
+    report: Annotated[
+        Path | None,
+        typer.Option(
+            help="The JSON test report (`modelbump test --format json`), added as evidence.",
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
+    repairs: Annotated[
+        Path | None,
+        typer.Option(
+            help="The repair report (`modelbump repair run`): accepted repairs go into the code.",
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
+    proposals: Annotated[
+        Path | None,
+        typer.Option(
+            help="The folder from `modelbump repair propose`, holding the accepted patches.",
+            exists=True,
+            file_okay=False,
+        ),
+    ] = None,
+    patch: Annotated[
+        Path | None,
+        typer.Option(
+            help="A patch file to write into the code instead of --repairs, e.g. one tested "
+            "with `modelbump test --patch`.",
+            exists=True,
+            dir_okay=False,
+        ),
+    ] = None,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option(help="Skip paths matching this pattern, e.g. 'tests'. Repeat for more."),
+    ] = None,
+    today: Annotated[
+        datetime | None,
+        typer.Option(
+            formats=["%Y-%m-%d"],
+            help="Check the new model's retirement as if today were this day (YYYY-MM-DD).",
+        ),
+    ] = None,
+    pr_body_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--pr-body",
+            help="Write the pull request description (the evidence report) to this file.",
+            dir_okay=False,
+        ),
+    ] = None,
+    open_pull_request: Annotated[
+        bool,
+        typer.Option(
+            "--open-pr",
+            help="Write the files, commit them on a new branch, push, and open a pull request "
+            "with gh. Needs a clean git working tree.",
+        ),
+    ] = False,
+) -> None:
+    """Change a model ID to a new one wherever the code uses it (a dry run by default).
+
+    With --open-pr, the change goes to a new branch and a pull request whose
+    description is the evidence report.
+    """
+    registry = load_registry()
+    day = today.date() if today is not None else date.today()
+    new = to
+    if new is None:
+        found = registry.get(old)
+        new = found[1].replacement if found is not None else None
+        if new is None:
+            if found is None:
+                typer.echo(
+                    f"{old} is not in the registry, so there is no suggested replacement; "
+                    f"pass --to.{_did_you_mean(old, registry, path, exclude)}",
+                    err=True,
+                )
+            else:
+                typer.echo(f"The registry suggests no replacement for {old}; pass --to.", err=True)
+            raise typer.Exit(code=2)
+        typer.echo(f"Using the replacement the registry suggests: {new}.")
+    target = assess(new, registry, day)
+    if target.severity is Severity.RETIRED:
+        typer.echo(f"{new} shut down on {target.shutdown}; pick another model.", err=True)
+        raise typer.Exit(code=2)
+    if target.severity in (Severity.RETIRING_SOON, Severity.DEPRECATED):
+        typer.echo(f"Warning: {new} is deprecated too and shuts down on {target.shutdown}.")
+    try:
+        evidence = load_evidence(suite_file, report, repairs, proposals, patch)
+        plan = plan_bump(
+            path,
+            registry,
+            old,
+            new,
+            exclude=exclude or (),
+            include_docs=include_docs,
+            env=env,
+            evidence=evidence,
+        )
+        body = pr_body(plan, evidence, registry, day)
+        repo = None
+        if open_pull_request and plan.changes:
+            write = True
+            repo = check_repo(path, branch_name(old, new))
+        if write:
+            apply_plan(path, plan)
+    except (BumpError, ValueError) as error:
+        typer.echo(f"Error: {str(error).rstrip('.')}.", err=True)
+        raise typer.Exit(code=2) from error
+    except OSError as error:
+        typer.echo(f"Error: cannot write {error.filename}: {error.strerror}.", err=True)
+        raise typer.Exit(code=1) from error
+    _print_bump(plan, old, new, write, env, registry, evidence.redacted_total, path, exclude)
+    if pr_body_file is not None:
+        pr_body_file.write_text(body, encoding="utf-8")
+        typer.echo(f"Wrote the pull request description to {pr_body_file}.")
+    if open_pull_request and not plan.changes:
+        typer.echo("Nothing to change, so no pull request was opened.")
+    if repo is not None:
+        base = path.parent if path.is_file() else path
+        paths = [base / change.path for change in plan.changes]
+        try:
+            url = open_pr(repo, paths, branch_name(old, new), pr_title(plan), body)
+        except BumpError as error:
+            typer.echo(f"Error: {str(error).rstrip('.')}.", err=True)
+            typer.echo(
+                f"The files are changed. You are back on {repo.branch}; "
+                f"the branch {branch_name(old, new)} has what was committed.",
+                err=True,
+            )
+            raise typer.Exit(code=1) from error
+        typer.echo(f"Opened pull request {url} from branch {branch_name(old, new)}.")
+
+
+@app.command("bump-all")
+def bump_all(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Folder to check and change.", exists=True, resolve_path=True),
+    ] = Path("."),
+    within: Annotated[
+        int,
+        typer.Option(
+            min=0, help="Bump models that are retired or shut down within this many days."
+        ),
+    ] = DEFAULT_WITHIN,
+    open_pull_requests: Annotated[
+        bool,
+        typer.Option(
+            "--open-pr",
+            help="Open one pull request per model with gh. A model whose branch is already "
+            "there is skipped, so running this on a schedule never opens duplicates.",
+        ),
+    ] = False,
+    exclude: Annotated[
+        list[str] | None,
+        typer.Option(help="Skip paths matching this pattern, e.g. 'tests'. Repeat for more."),
+    ] = None,
+    today: Annotated[
+        datetime | None,
+        typer.Option(formats=["%Y-%m-%d"], help="Check as if today were this day (YYYY-MM-DD)."),
+    ] = None,
+) -> None:
+    """Bump every model the code uses that is retired or shuts down soon (Dependabot-style)."""
+    registry = load_registry()
+    day = today.date() if today is not None else date.today()
+    result = scan_path(path, registry, exclude or ())
+    due = due_models(path, registry, day, within, exclude or (), result)
+    if not due:
+        typer.echo(f"No model the code uses is retired or shuts down within {within} days.")
+        return
+    opened = skipped = 0
+    for model in due:
+        typer.echo(due_line(model))
+        if model.new is None:
+            typer.echo(f"  skipped: {model.reason}")
+            skipped += 1
+            continue
+        try:
+            plan = plan_bump(
+                path, registry, model.old, model.new, exclude=exclude or (), result=result
+            )
+            if not plan.changes:
+                typer.echo("  skipped: nothing to change automatically (see `modelbump bump`)")
+                skipped += 1
+                continue
+            if not open_pull_requests:
+                places, files = len(plan.edits), len(plan.changes)
+                typer.echo(
+                    f"  would change {places} {_plural(places, 'place')} in "
+                    f"{files} {_plural(files, 'file')}"
+                )
+                continue
+            branch = branch_name(model.old, model.new)
+            try:
+                repo = check_repo(path, branch)
+            except BranchExists as error:
+                typer.echo(f"  skipped: {error}")
+                skipped += 1
+                continue
+            apply_plan(path, plan)
+            base = path.parent if path.is_file() else path
+            url = open_pr(
+                repo,
+                [base / change.path for change in plan.changes],
+                branch,
+                pr_title(plan),
+                pr_body(plan, None, registry, day),
+            )
+        except BumpError as error:
+            typer.echo(f"Error: {str(error).rstrip('.')}.", err=True)
+            raise typer.Exit(code=1) from error
+        typer.echo(f"  opened {url}")
+        opened += 1
+    if open_pull_requests:
+        typer.echo(
+            f"Due: {len(due)} {_plural(len(due), 'model')}; opened {opened} "
+            f"{_plural(opened, 'pull request')}, skipped {skipped}."
+        )
+    else:
+        typer.echo("Nothing was changed. Add --open-pr to open one pull request per model.")
+
+
+def _print_bump(
+    plan: BumpPlan,
+    old: str,
+    new: str,
+    write: bool,
+    env: str | None,
+    registry: Registry,
+    redacted: Counter[str] | None = None,
+    root: Path = Path("."),
+    exclude: list[str] | None = None,
+) -> None:
+    places = len(plan.edits)
+    files = sum(1 for change in plan.changes if change.edits)
+    code_changed = any(not change.evidence for change in plan.changes)
+    if code_changed and not write:
+        typer.echo(plan_diff(plan), nl=False)
+    if places == 0:
+        scanned = plan.files_scanned
+        hint = _did_you_mean(old, registry, root, exclude) if not plan.skipped else ""
+        typer.echo(
+            f"No place that uses {old} needs a change "
+            f"(scanned {scanned} {_plural(scanned, 'file')}).{hint}"
+        )
+    else:
+        verb = "Changed" if write else "Would change"
+        typer.echo(
+            f"{verb} {places} {_plural(places, 'place')} in {files} {_plural(files, 'file')}: "
+            f"{old} -> {new}." + (_moved_note(plan) if plan.moved else "")
+        )
+    if plan.repaired:
+        verb = "Repaired" if write else "Would repair"
+        count = len(plan.repaired)
+        typer.echo(
+            f"{verb} the prompt of {count} {_plural(count, 'call')} in the code: "
+            f"{', '.join(plan.repaired)}."
+        )
+    if plan.by_hand:
+        typer.echo(
+            f"Apply by hand ({len(plan.by_hand)}); the patch is in {EVIDENCE_DIR}/repairs.json:"
+        )
+        for call, reason in plan.by_hand:
+            typer.echo(f"  {call}  ({reason})")
+    evidence = [change for change in plan.changes if change.evidence]
+    if evidence:
+        verb = "Added" if write else "Would add"
+        tested = f", tested {plan.tested[0]} -> {plan.tested[1]}" if plan.tested else ""
+        typer.echo(f"{verb} evidence{tested}:")
+        for change in evidence:
+            typer.echo(f"  {change.path}" + ("" if change.created else "  (updated)"))
+    if redacted:
+        typer.echo(f"Redacted from the evidence: {redacted_summary(redacted)}.")
+    if plan.skipped:
+        typer.echo(f"Left alone, check by hand ({len(plan.skipped)}):")
+        for line in skipped_lines(plan):
+            typer.echo(line)
+    if env is None and plan.movable:
+        typer.echo(
+            f"Tip: {plan.movable} {_plural(plan.movable, 'place')} "
+            f"{'hard-codes' if plan.movable == 1 else 'hard-code'} the model. "
+            f"Add --env {suggested_env_name(old, registry)} to read it from the environment, "
+            "so the next change is one setting."
+        )
+    if plan.changes and not write:
+        typer.echo("Nothing was written. Run again with --write to change the files.")
+
+
+def _moved_note(plan: BumpPlan) -> str:
+    """`` 2 now read OPENAI_MODEL (added to .env.example).``"""
+    verb = "reads" if plan.moved == 1 else "read"
+    note = f" {plan.moved} now {verb} {plan.env}"
+    line = f"{plan.env}="
+    for change in plan.changes:
+        if change.path == ".env.example" and line in change.after and line not in change.before:
+            note += " (added to .env.example)"
+    return note + "."
+
+
+def _did_you_mean(model_id: str, registry: Registry, root: Path, exclude: list[str] | None) -> str:
+    """`` Did you mean gpt-4o-mini?`` for a near miss of an ID in the code or the registry."""
+    if registry.get(model_id) is not None:
+        return ""
+    in_code = {f.model_id for f in scan_path(root, registry, exclude or ()).findings}
+    if model_id in in_code:
+        return ""
+    known = sorted(in_code | {i for _, model in registry for i in model.all_ids()})
+    close = difflib.get_close_matches(model_id, known, n=1, cutoff=0.85)
+    return f" Did you mean {close[0]}?" if close else ""
+
+
+def _plural(count: int, word: str) -> str:
+    return word if count == 1 else word + "s"
 
 
 @app.command()
